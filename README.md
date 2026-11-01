@@ -108,6 +108,13 @@ Kaiwa works with either:
   tier), **OpenAI**, or **Anthropic Claude** in Settings. Much faster and
   smarter; your messages go to that provider. Keys are stored only in your
   local database and are never shown to the browser again.
+- **Claude CLI (optional, personal use)** — if you already have
+  [Claude Code](https://claude.com/claude-code) installed and logged in, pick
+  **Claude CLI** in Settings (models `haiku` / `sonnet` / `opus`); no API key
+  needed. Kaiwa runs `claude -p` with tools, MCP and your project settings
+  disabled. Each call starts a process, so replies have higher latency than the
+  API providers. Your messages go to Anthropic; check Anthropic's terms to make
+  sure this kind of use is allowed for your plan.
 
 Speech recognition, speech synthesis, the dictionary, and all your data stay
 local either way.
