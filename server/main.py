@@ -2,6 +2,7 @@
 
 LLM: Ollama (Qwen3-4B) · STT: whisper.cpp · TTS: VOICEVOX / macOS say
 """
+import asyncio
 import io
 import json
 import os
@@ -34,9 +35,9 @@ def current_model() -> str | None:
     return llm.resolve_model(setting("model"))
 
 
-def llm_config() -> dict:
-    """Active provider config for llm.chat_stream / llm.chat_json."""
-    provider = setting("provider", "ollama")
+def llm_config(provider: str | None = None) -> dict:
+    """Active (or the given) provider's config for llm.chat_stream / llm.chat_json."""
+    provider = provider or setting("provider", "ollama")
     if provider not in llm.PROVIDERS:
         provider = "ollama"
     if provider == "ollama":
@@ -73,6 +74,7 @@ def health():
         "provider_label": llm.PROVIDERS[cfg["provider"]]["label"],
         "llm_ready": llm.not_ready_reason(cfg) is None,
         "ollama": llm.ollama_up(),
+        "claude_cli": llm.claude_cli_available(),
         "model": cfg["model"],
         "models": llm.list_models(),
         "whisper": stt.available(),
@@ -86,6 +88,17 @@ def health():
 @app.get("/api/setup/hardware")
 def setup_hardware():
     return setup.hardware_info()
+
+
+@app.post("/api/setup/claude_test")
+def setup_claude_test():
+    """One tiny call through the Claude CLI so the wizard can confirm it is installed and logged in."""
+    try:
+        llm.chat_json('Reply with exactly this JSON and nothing else: {"ok": true}',
+                      llm_config("claude_cli"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300]}
+    return {"ok": True}
 
 
 @app.get("/api/setup/phone")
@@ -310,7 +323,7 @@ async def correct(req: Request):
     if not msg:
         return JSONResponse({"error": "no such message"}, status_code=404)
     level = db.get_profile()["jlpt_level"]
-    result = llm.chat_json(
+    result = await asyncio.to_thread(llm.chat_json,
         prompts.CORRECTION_PROMPT.format(level=level, text=msg["text"]),
         llm_config(),
     )
@@ -333,8 +346,8 @@ async def translate(req: Request):
         text = msg["text"] if msg else ""
     else:
         text = body.get("text", "")
-    result = llm.chat_json(prompts.TRANSLATE_PROMPT.format(text=text),
-                           llm_config(), num_predict=200)
+    result = await asyncio.to_thread(llm.chat_json, prompts.TRANSLATE_PROMPT.format(text=text),
+                                     llm_config(), num_predict=200)
     translation = result.get("translation", "")
     if body.get("message_id") and translation:
         db.set_message_translation(body["message_id"], translation)
@@ -347,7 +360,7 @@ async def hint(req: Request):
     sid = body["session_id"]
     level = db.get_profile()["jlpt_level"]
     history = prompts.build_hint_history(db.get_messages(sid))
-    result = llm.chat_json(
+    result = await asyncio.to_thread(llm.chat_json,
         prompts.HINT_PROMPT.format(level=level,
                                    level_guide=prompts.LEVEL_GUIDE.get(level, ""),
                                    history=history),
@@ -395,8 +408,9 @@ async def word(req: Request):
         }
 
     # 2) LLM fallback for names/slang/phrases JMdict doesn't know.
-    result = llm.chat_json(prompts.WORD_PROMPT.format(word=w, sentence=sentence),
-                           llm_config(), num_predict=250)
+    result = await asyncio.to_thread(llm.chat_json,
+                                     prompts.WORD_PROMPT.format(word=w, sentence=sentence),
+                                     llm_config(), num_predict=250)
     return {
         "word": w,
         "reading": info["reading"],

@@ -298,6 +298,10 @@
           <svg class="icon"><use href="/static/icons.svg#sparkles"/></svg>
           <div><b>Cloud AI</b><br><small>Faster &amp; smarter. Needs an API key (Google Gemini has a free tier).</small></div>
         </div>
+        <div class="setup-opt" id="ob-opt-claude">
+          <svg class="icon"><use href="/static/icons.svg#message-circle"/></svg>
+          <div><b>Claude CLI</b><br><small>Use the Claude Code already installed and logged in on this computer. No API key. Each reply takes a little longer.</small></div>
+        </div>
       </div>
 
       <div id="ob-local" class="hidden">
@@ -313,6 +317,19 @@
             <div class="progress"><div id="ob-pull-fill" class="progress-fill"></div></div>
             <p id="ob-pull-status" class="sub"></p>
           </div>
+        </div>
+      </div>
+
+      <div id="ob-claude" class="hidden">
+        <div id="ob-claude-missing" class="hidden">
+          <p>Kaiwa couldn't find the <b>claude</b> command on this computer.</p>
+          <p><a class="btn primary" href="https://claude.com/claude-code" target="_blank" rel="noopener">Get Claude Code ↗</a></p>
+          <p class="sub"><svg class="icon spin"><use href="/static/icons.svg#loader"/></svg> Install it, run <code>claude</code> once to log in — I'll notice automatically…</p>
+        </div>
+        <div id="ob-claude-found" class="hidden">
+          <p>Found Claude Code. Make sure you've logged in (run <code>claude</code> in a terminal once), then test the connection.</p>
+          <button id="ob-claude-test" class="btn primary">Test &amp; continue ➤</button>
+          <p id="ob-claude-status" class="sub"></p>
         </div>
       </div>
 

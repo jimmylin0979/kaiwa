@@ -7,8 +7,13 @@ All providers speak through two calls:
 cfg comes from main.llm_config(): {"provider": ..., "model": ..., "key": ...}.
 Cloud providers use raw HTTP (requests) on purpose — no SDKs, zero extra dependencies.
 """
+import contextlib
 import json
 import os
+import shutil
+import subprocess
+import tempfile
+import threading
 
 import requests
 
@@ -36,6 +41,9 @@ PROVIDERS = {
                "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]},
     "anthropic": {"label": "Anthropic Claude", "needs_key": True,
                   "models": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"]},
+    # Local `claude` terminal CLI (Claude Code), already logged in — no API key.
+    "claude_cli": {"label": "Claude CLI (local login)", "needs_key": False,
+                   "models": ["haiku", "sonnet", "opus"]},
 }
 
 _model_cache = None
@@ -76,11 +84,19 @@ def ollama_up() -> bool:
 
 # ---------------------------------------------------------------- readiness
 
+def claude_cli_available() -> bool:
+    return shutil.which("claude") is not None
+
+
 def not_ready_reason(cfg: dict) -> str | None:
     """None if the active provider can serve requests, else a user-facing message."""
     if cfg["provider"] == "ollama":
         if not cfg["model"]:
             return "Ollama is not running or no model installed"
+        return None
+    if cfg["provider"] == "claude_cli":
+        if not claude_cli_available():
+            return "Claude CLI not found — install Claude Code and log in"
         return None
     if not cfg["key"]:
         label = PROVIDERS[cfg["provider"]]["label"]
@@ -147,6 +163,8 @@ def chat_stream(messages: list, cfg: dict, temperature=0.7, num_predict=200):
     elif p == "anthropic":
         yield from _anthropic_stream(messages, cfg["model"], cfg["key"],
                                      _cloud_max_tokens(num_predict))
+    elif p == "claude_cli":
+        yield from _claude_cli_stream(messages, cfg["model"])
     else:
         raise RuntimeError(f"unknown provider: {p}")
 
@@ -165,6 +183,8 @@ def chat_json(prompt: str, cfg: dict, temperature=0.2, num_predict=350) -> dict:
     if p == "anthropic":
         return _anthropic_json(prompt, cfg["model"], cfg["key"],
                                _cloud_max_tokens(num_predict))
+    if p == "claude_cli":
+        return _claude_cli_json(prompt, cfg["model"])
     raise RuntimeError(f"unknown provider: {p}")
 
 
@@ -333,3 +353,133 @@ def _anthropic_json(prompt, model, key, max_tokens) -> dict:
     content = "".join(b.get("text", "") for b in r.json().get("content", [])
                       if b.get("type") == "text")
     return _parse_json(content)
+
+
+# ---------------------------------------------------------- claude CLI backend
+
+CLAUDE_CLI_TIMEOUT = 120  # seconds; every call spawns a process, so it is slower than an API
+
+
+def _claude_cli_prompt(messages: list) -> tuple[str, str]:
+    """Flatten a messages list into (system, prompt) — the CLI has no messages array."""
+    system, rest = _split_system(messages)
+    if len(rest) == 1 and rest[0]["role"] == "user":
+        return system, rest[0]["content"]
+    names = {"user": "User", "assistant": "Assistant"}
+    lines = [f"{names.get(m['role'], 'User')}: {m['content']}" for m in rest]
+    return system, ("Conversation so far:\n\n" + "\n\n".join(lines) +
+                    "\n\nReply as the Assistant to the last User message. "
+                    "Output only the reply text, without a role prefix.")
+
+
+# Each call is a node process (~hundreds of MB); cap how many run at once.
+_claude_cli_slots = threading.BoundedSemaphore(2)
+
+
+@contextlib.contextmanager
+def _claude_cli_proc(system: str, model: str, extra: list):
+    """Run one `claude -p`; always kills it, frees its slot and deletes the temp file."""
+    if not _claude_cli_slots.acquire(timeout=CLAUDE_CLI_TIMEOUT):
+        raise RuntimeError("Claude CLI is busy — try again in a moment")
+    sysfile = None
+    try:
+        # Plain chat model, not a coding agent: no tools, no MCP, no skills, no
+        # session files, no user/project settings (so CLAUDE.md is not loaded), and
+        # a neutral cwd. Prompt via stdin and system prompt via a file, so argv holds
+        # only plain tokens (Windows runs claude.cmd through cmd.exe, which mangles
+        # quotes/newlines and caps the command line at 32k chars).
+        cmd = [shutil.which("claude") or "claude", "-p", "--model", model, "--tools", "",
+               "--strict-mcp-config", "--disable-slash-commands",
+               "--no-session-persistence", "--setting-sources", ""] + extra
+        if system:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt",
+                                             delete=False) as f:
+                f.write(system)
+            sysfile = f.name
+            cmd += ["--system-prompt-file", sysfile]
+        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}  # use the CLI login
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, cwd=tempfile.gettempdir(),
+                                    env=env, text=True, encoding="utf-8")
+        except FileNotFoundError:
+            raise RuntimeError("Claude CLI not found — install Claude Code and log in")
+        try:
+            yield proc
+        finally:  # also runs when a stream consumer closes the generator early
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+    finally:
+        if sysfile:
+            os.unlink(sysfile)
+        _claude_cli_slots.release()
+
+
+def _claude_cli_error(proc: subprocess.Popen, detail: str = "") -> RuntimeError:
+    err = detail or ("" if proc.stderr.closed else proc.stderr.read()).strip()  # communicate() closes it
+    return RuntimeError(f"Claude CLI error: {err[:200] or 'exit code %s' % proc.returncode}"
+                        " — make sure Claude Code is installed and logged in")
+
+
+def _claude_cli_stream(messages, model):
+    system, prompt = _claude_cli_prompt(messages)
+    with _claude_cli_proc(system, model, ["--output-format", "stream-json", "--verbose",
+                                          "--include-partial-messages"]) as proc:
+        timed_out = threading.Event()
+
+        def _timeout():
+            timed_out.set()
+            proc.kill()
+        timer = threading.Timer(CLAUDE_CLI_TIMEOUT, _timeout)
+        timer.start()
+
+        def _write():  # on a thread so a full stdout pipe can't deadlock us
+            try:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        threading.Thread(target=_write, daemon=True).start()
+        got_text, result_err = False, ""
+        try:
+            for line in proc.stdout:
+                if not line.startswith("{"):
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") == "stream_event":
+                    d = (ev.get("event") or {}).get("delta") or {}
+                    if d.get("type") == "text_delta" and d.get("text"):
+                        got_text = True
+                        yield d["text"]
+                elif ev.get("type") == "result":
+                    if ev.get("is_error"):
+                        result_err = str(ev.get("result") or "")
+                    elif not got_text and ev.get("result"):
+                        got_text = True
+                        yield ev["result"]  # no partials arrived; fall back to the final text
+            proc.wait()
+        finally:
+            timer.cancel()
+        if timed_out.is_set():  # raise even after partial text so a cut-off reply isn't saved
+            raise RuntimeError("Claude CLI timed out")
+        if result_err or (proc.returncode != 0 and not got_text):
+            raise _claude_cli_error(proc, result_err)
+
+
+def _claude_cli_json(prompt, model) -> dict:
+    with _claude_cli_proc("", model, ["--output-format", "json"]) as proc:
+        try:
+            out, err = proc.communicate(input=prompt, timeout=CLAUDE_CLI_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Claude CLI timed out")
+    try:
+        res = json.loads(out)
+    except json.JSONDecodeError:
+        res = {}
+    if proc.returncode != 0 or res.get("is_error"):
+        raise _claude_cli_error(proc, str(res.get("result") or err).strip())
+    return _parse_json(res.get("result") or "")

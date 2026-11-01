@@ -136,19 +136,22 @@ async function startOnboarding() {
 
 /* --- step 0: pick + set up the AI --- */
 let obPoll = null;
-function obPanel(name) { // "choice" | "local" | "cloud"
+function obPanel(name) { // "choice" | "local" | "claude" | "cloud"
   $("#ob-ai-choice").classList.toggle("hidden", name !== "choice");
   $("#ob-local").classList.toggle("hidden", name !== "local");
+  $("#ob-claude").classList.toggle("hidden", name !== "claude");
   $("#ob-cloud").classList.toggle("hidden", name !== "cloud");
   $("#ob-ai-back-row").classList.toggle("hidden", name === "choice");
-  if (name !== "local" && obPoll) { clearInterval(obPoll); obPoll = null; }
+  if (obPoll) { clearInterval(obPoll); obPoll = null; } // the panel's own check restarts it
 }
 $("#ob-opt-local").addEventListener("click", () => { obPanel("local"); obLocalCheck(); });
 $("#ob-opt-cloud").addEventListener("click", () => { obPanel("cloud"); obCloudInit(); });
+$("#ob-opt-claude").addEventListener("click", () => { obPanel("claude"); obClaudeCheck(); });
 $("#ob-ai-back").addEventListener("click", () => obPanel("choice"));
 
 async function obLocalCheck() {
   const h = await api.get("/api/health");
+  if ($("#ob-local").classList.contains("hidden")) return; // user left the panel mid-request
   if (!h.ollama) {
     $("#ob-ollama-missing").classList.remove("hidden");
     $("#ob-model-dl").classList.add("hidden");
@@ -212,6 +215,33 @@ async function obPull(model) {
     $("#ob-pull-btn").disabled = false;
   }
 }
+
+/* --- step 0, Claude CLI path --- */
+async function obClaudeCheck() {
+  const h = await api.get("/api/health");
+  if ($("#ob-claude").classList.contains("hidden")) return; // user left the panel mid-request
+  $("#ob-claude-missing").classList.toggle("hidden", h.claude_cli);
+  $("#ob-claude-found").classList.toggle("hidden", !h.claude_cli);
+  if (h.claude_cli) {
+    if (obPoll) { clearInterval(obPoll); obPoll = null; }
+  } else if (!obPoll) obPoll = setInterval(obClaudeCheck, 3000); // watch for the CLI appearing
+}
+$("#ob-claude-test").addEventListener("click", async () => {
+  const btn = $("#ob-claude-test"), status = $("#ob-claude-status");
+  btn.disabled = true;
+  status.textContent = "Testing — this can take a few seconds…";
+  try {
+    const r = await api.post("/api/setup/claude_test", {});
+    if (!r.ok) throw new Error(r.error || "test failed");
+    await api.post("/api/settings", { provider: "claude_cli" });
+    updateHealth();
+    status.textContent = "Connected!";
+    setTimeout(() => obShow("profile"), 500);
+  } catch (e) {
+    status.textContent = "Couldn't reach Claude: " + e.message;
+    btn.disabled = false;
+  }
+});
 
 /* --- step 0, cloud path --- */
 const OB_KEY_HINTS = {
